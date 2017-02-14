@@ -741,8 +741,10 @@ impl Node {
         self.send_ack(signed_msg.routing_message(), route);
         // If the destination is our section we need to forward it to the rest of the section
         if signed_msg.routing_message().dst.is_multiple() {
-            if let Err(error) = self.send_signed_message(signed_msg, route, &hop_name, sent_to) {
-                debug!("{:?} Failed to send signed message: {:?}", self, error);
+            // TODO: maybe eventually don't clone signed_msg just so we can log it on error?
+            if let Err(error) =
+                self.send_signed_message(signed_msg.clone(), route, &hop_name, sent_to) {
+                debug!("{:?} Failed to send {:?}: {:?}", self, signed_msg, error);
             }
         }
     }
@@ -771,7 +773,7 @@ impl Node {
         } else {
             let list = self.section_list_sigs.get_signed_list(&hop_prefix);
             if list.is_none() {
-                warn!("{:?} NoSecSigInCache: sender {:?} of signed message {:?} to {:?} \
+                warn!("{:?} NoSectionSigInCache: sender {:?} of signed message {:?} to {:?} \
                         via hop {:?} cannot be verified",
                       self,
                       signed_msg.routing_message().src,
@@ -819,8 +821,10 @@ impl Node {
         if let Some(list) = section_list {
             signed_msg.add_relaying_section(list);
         }
-        if let Err(error) = self.send_signed_message(signed_msg, route, &hop_name, sent_to) {
-            debug!("{:?} Failed to send signed message: {:?}", self, error);
+        // TODO: maybe eventually don't clone signed_msg just so we can log it on error?
+        if let Err(error) =
+            self.send_signed_message(signed_msg.clone(), route, &hop_name, sent_to) {
+            debug!("{:?} Failed to send {:?}: {:?}", self, signed_msg, error);
         }
 
         Ok(())
@@ -984,7 +988,7 @@ impl Node {
         info!("{:?} Our section with {:?} has approved candidate {}. Adding it to our routing \
                table as a peer {:?}.",
               self,
-              self.peer_mgr.routing_table().our_prefix(),
+              self.our_prefix(),
               candidate_id.name(),
               opt_peer_id);
         let src = Authority::Section(*candidate_id.name());
@@ -1028,7 +1032,7 @@ impl Node {
             outbox.send_event(Event::NodeAdded(*name, self.peer_mgr.routing_table().clone()));
         }
 
-        let our_prefix = *self.peer_mgr.routing_table().our_prefix();
+        let our_prefix = *self.our_prefix();
         self.send_section_list_signature(our_prefix, None);
 
         for section in sections.values() {
@@ -1184,7 +1188,7 @@ impl Node {
                       self,
                       name,
                       Self::format(elapsed),
-                      self.peer_mgr.routing_table().our_prefix());
+                      self.our_prefix());
                 self.candidate_timer_token = None;
                 let _ = self.send_candidate_approval();
             }
@@ -1194,7 +1198,7 @@ impl Node {
                       self,
                       name,
                       Self::format(elapsed),
-                      self.peer_mgr.routing_table().our_prefix());
+                      self.our_prefix());
             }
         }
     }
@@ -1492,7 +1496,7 @@ impl Node {
 
         if let Some(prefix) = self.peer_mgr.routing_table().find_section_prefix(public_id.name()) {
             self.send_section_list_signature(prefix, None);
-            if prefix == *self.peer_mgr.routing_table().our_prefix() {
+            if prefix == *self.our_prefix() {
                 // if the node joined our section, send signatures for all section lists to it
                 for pfx in self.peer_mgr.routing_table().prefixes() {
                     self.send_section_list_signature(pfx, Some(*public_id.name()));
@@ -1519,7 +1523,7 @@ impl Node {
 
         let neighbours = self.peer_mgr.routing_table().other_prefixes();
         for neighbour_pfx in neighbours {
-            let src = Authority::Section(self.peer_mgr.routing_table().our_prefix().lower_bound());
+            let src = Authority::Section(self.our_prefix().lower_bound());
             let dst = Authority::PrefixSection(neighbour_pfx);
 
             if let Err(err) = self.send_routing_message(src, dst, content.clone()) {
@@ -2013,7 +2017,7 @@ impl Node {
         };
         info!("{:?} Our section with {:?} accepted {} as a candidate.",
               self,
-              self.peer_mgr.routing_table().our_prefix(),
+              self.our_prefix(),
               candidate_id.name());
         trace!("{:?} Sending {:?} to {:?}",
                self,
@@ -2112,12 +2116,12 @@ impl Node {
                    self.rt_msg_id);
             return Ok(());
         }
-        let old_prefix = *self.peer_mgr.routing_table().our_prefix();
+        let old_prefix = *self.our_prefix();
         for (name, peer_id) in self.peer_mgr.add_prefix(prefix) {
             self.disconnect_peer(&peer_id);
             info!("{:?} Dropped {:?} from the routing table.", self, name);
         }
-        let new_prefix = *self.peer_mgr.routing_table().our_prefix();
+        let new_prefix = *self.our_prefix();
         if old_prefix.bit_count() < new_prefix.bit_count() {
             trace!("{:?} Found out about our section splitting via RT response {:?}",
                    self,
@@ -2152,7 +2156,7 @@ impl Node {
                             joining_node: XorName,
                             outbox: &mut EventBox)
                             -> Result<(), RoutingError> {
-        let split_us = prefix == *self.peer_mgr.routing_table().our_prefix();
+        let split_us = prefix == *self.our_prefix();
         // Send SectionSplit notifications if we don't know of the new node yet
         if split_us && !self.peer_mgr.routing_table().has(&joining_node) {
             self.send_section_split(prefix, joining_node);
@@ -2377,7 +2381,7 @@ impl Node {
                    utils::format_binary_array(&digest));
 
             let src = Authority::ManagedNode(*self.name());
-            let dst = Authority::PrefixSection(*self.peer_mgr.routing_table().our_prefix());
+            let dst = Authority::PrefixSection(*self.our_prefix());
             let content = MessageContent::RoutingTableRequest(msg_id, digest);
             if let Err(err) = self.send_routing_message(src, dst, content) {
                 debug!("{:?} Failed to send RoutingTableRequest: {:?}.", self, err);
@@ -2451,7 +2455,7 @@ impl Node {
         Ok(())
     }
 
-    // Send signed_msg on route. Hop if the name of the peer we received this from, or our name if
+    // Send signed_msg on route. Hop is the name of the peer we received this from, or our name if
     // we are the first sender or the proxy for a client or joining node.
     //
     // Don't send to any nodes already sent_to.
@@ -2896,7 +2900,6 @@ impl Node {
         }
     }
 
-    /// Shortcut to get our prefix
     fn our_prefix(&self) -> &Prefix<XorName> {
         self.peer_mgr.routing_table().our_prefix()
     }
@@ -3037,11 +3040,10 @@ impl Node {
     pub fn section_list_signatures(&self,
                                    prefix: &Prefix<XorName>)
                                    -> Result<BTreeMap<PublicId, sign::Signature>, RoutingError> {
-        if let Some(ssl) = self.section_list_sigs.get_signed_list(prefix) {
-            Ok(ssl.signatures.iter().map(|(&pub_id, &sig)| (pub_id, sig)).collect())
-        } else {
-            Err(RoutingError::NotEnoughSignatures)
-        }
+        self.section_list_sigs
+            .get_signed_list(prefix)
+            .map(|ssl| ssl.signatures)
+            .ok_or(RoutingError::NotEnoughSignatures)
     }
 
     pub fn set_next_node_name(&mut self, relocation_name: Option<XorName>) {
@@ -3081,7 +3083,7 @@ impl Bootstrapped for Node {
             ClientManager(_) | NaeManager(_) | NodeManager(_) | ManagedNode(_) | Section(_) => {
                 vec![self.section_list_sigs
                          .get_signed_list(self.our_prefix())
-                         .ok_or(RoutingTableError::NoSecSigInCache)?]
+                         .ok_or(RoutingError::NoSectionSigInCache)?]
             }
             PrefixSection(ref prefix) => {
                 let prefixes = self.peer_mgr
@@ -3096,7 +3098,7 @@ impl Bootstrapped for Node {
                     // an iterator chain here:
                     v.push(self.section_list_sigs
                         .get_signed_list(&p)
-                        .ok_or(RoutingTableError::NoSecSigInCache)?);
+                        .ok_or(RoutingError::NoSectionSigInCache)?);
                 }
                 v
             }
@@ -3148,10 +3150,7 @@ impl Bootstrapped for Node {
 
 impl Debug for Node {
     fn fmt(&self, formatter: &mut Formatter) -> fmt::Result {
-        write!(formatter,
-               "Node({}({:b}))",
-               self.name(),
-               self.peer_mgr.routing_table().our_prefix())
+        write!(formatter, "Node({}({:b}))", self.name(), self.our_prefix())
     }
 }
 
