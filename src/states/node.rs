@@ -15,6 +15,7 @@
 // Please review the Licences for the specific language governing permissions and limitations
 // relating to use of the SAFE Network Software.
 
+use ::QUORUM;
 use ack_manager::{ACK_TIMEOUT_SECS, Ack, AckManager};
 use action::Action;
 use cache::Cache;
@@ -674,7 +675,7 @@ impl Node {
         for peer_id in peers {
             let msg = DirectMessage::SectionListSignature(section.clone(), sig);
             if let Err(e) = self.send_direct_message(peer_id, msg) {
-                warn!("{:?} Failed to send sending section list signature for {:?} to {:?}: {:?}",
+                warn!("{:?} Failed to send section list signature for {:?} to {:?}: {:?}",
                       self,
                       prefix,
                       peer_id,
@@ -764,36 +765,54 @@ impl Node {
             .routing_table()
             .find_section_prefix(&hop_name)
             .ok_or(RoutingTableError::NoSuchPeer)?;
-        let section_list = if signed_msg.routing_message().src.is_client() ||
-                              self.in_authority(&signed_msg.routing_message().src) {
-            // No point verifying the route if from a client; we also don't need to verify if the
-            // message is from our own section.
-            // TODO: possibly we should if the message is from a PrefixSection.
-            None
-        } else {
-            let list = self.section_list_sigs.get_signed_list(&hop_prefix);
-            if list.is_none() {
-                warn!("{:?} NoSectionSigInCache: sender {:?} of signed message {:?} to {:?} \
-                        via hop {:?} cannot be verified",
-                      self,
-                      signed_msg.routing_message().src,
-                      signed_msg.routing_message().content,
-                      signed_msg.routing_message().dst,
-                      hop_name);
-            }
-            list
-        };
+        // Only messages from routing nodes, groups or sections need the hop signature lists.
+        if !signed_msg.routing_message().src.is_client() &&
+           !signed_msg.routing_message().src.is_single() &&
+           !(signed_msg.routing_message().dst.is_client() &&
+             self.in_authority(&signed_msg.routing_message().dst)) {
+            // Don't add another section list if the previous hop was already in `dst`.
+            if sent_to.is_empty() || signed_msg.last_relay_section().is_none() {
+                match self.section_list_sigs.get_signed_list(&hop_prefix) {
+                    None => {
+                        warn!("{:?} NoSectionSigInCache: sender {:?} of signed message {:?} to \
+                               {:?} via hop {:?} cannot be verified",
+                              self,
+                              signed_msg.routing_message().src,
+                              signed_msg.routing_message().content,
+                              signed_msg.routing_message().dst,
+                              hop_name);
+                    }
+                    Some(list) => signed_msg.add_relaying_section(list),
+                }
+            };
 
-        // Check the message's signatures, and (if we have a section list) the sender.
-        match signed_msg.check_integrity(self.min_section_size(),
-                                         section_list.as_ref().map(|sl| &sl.list)) {
-            Ok(()) => {}
-            Err(e) => {
-                warn!("{:?} Verification of {:?} failed: {:?}",
-                      self,
-                      signed_msg,
-                      e);
-                return Err(e.into());
+            // TODO: For now we just validate that a minimum number of signatories of the last
+            // relay section is known to us.
+            let min_section_size = self.peer_mgr.routing_table().min_section_size();
+            if self.peer_mgr.routing_table().len() >= min_section_size &&
+               !signed_msg.last_relay_section().map_or(false, |ssl| {
+                ssl.signatures
+                    .keys()
+                    .filter(|pub_id| {
+                        self.peer_mgr.routing_table().has(pub_id.name()) &&
+                        self.peer_mgr.known_id(pub_id)
+                    })
+                    .take(QUORUM * min_section_size / 100)
+                    .count() == QUORUM * min_section_size / 100
+            }) {
+                return Err(RoutingError::NotEnoughSignatures);
+            };
+
+            // Check the message's signatures, and (if we have a section list) the sender.
+            match signed_msg.check_integrity(self.min_section_size()) {
+                Ok(()) => {}
+                Err(e) => {
+                    warn!("{:?} Verification of {:?} failed: {:?}",
+                          self,
+                          signed_msg,
+                          e);
+                    return Err(e.into());
+                }
             }
         }
 
@@ -818,9 +837,6 @@ impl Node {
             return Ok(());
         }
 
-        if let Some(list) = section_list {
-            signed_msg.add_relaying_section(list);
-        }
         // TODO: maybe eventually don't clone signed_msg just so we can log it on error?
         if let Err(error) =
             self.send_signed_message(signed_msg.clone(), route, &hop_name, sent_to) {
@@ -1363,16 +1379,6 @@ impl Node {
                self,
                public_id.name());
         self.add_to_routing_table(&public_id, &peer_id, outbox);
-
-        if let Some(prefix) = self.peer_mgr.routing_table().find_section_prefix(public_id.name()) {
-            self.send_section_list_signature(prefix, None);
-            if prefix == *self.our_prefix() {
-                // if the node joined our section, send signatures for all section lists to it
-                for pfx in self.peer_mgr.routing_table().prefixes() {
-                    self.send_section_list_signature(pfx, Some(*public_id.name()));
-                }
-            }
-        }
     }
 
     fn handle_candidate_identify(&mut self,
@@ -1494,12 +1500,16 @@ impl Node {
             let _ = self.send_direct_message(*peer_id, tunnel_request);
         }
 
-        if let Some(prefix) = self.peer_mgr.routing_table().find_section_prefix(public_id.name()) {
-            self.send_section_list_signature(prefix, None);
-            if prefix == *self.our_prefix() {
-                // if the node joined our section, send signatures for all section lists to it
-                for pfx in self.peer_mgr.routing_table().prefixes() {
-                    self.send_section_list_signature(pfx, Some(*public_id.name()));
+        if self.is_approved {
+            if let Some(prefix) = self.peer_mgr
+                .routing_table()
+                .find_section_prefix(public_id.name()) {
+                self.send_section_list_signature(prefix, None);
+                if prefix == *self.our_prefix() {
+                    // if the node joined our section, send signatures for all section lists to it
+                    for pfx in self.peer_mgr.routing_table().prefixes() {
+                        self.send_section_list_signature(pfx, Some(*public_id.name()));
+                    }
                 }
             }
         }

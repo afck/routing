@@ -177,8 +177,8 @@ impl Client {
         }
 
         let signed_msg = hop_msg.content;
-        // TODO: verify with proxy's section list instead of passing None here:
-        match signed_msg.check_integrity(self.min_section_size(), None) {
+        // TODO: verify with proxy's section list:
+        match signed_msg.check_integrity(self.min_section_size()) {
             Ok(()) => {}
             Err(e) => {
                 warn!("{:?} Verification of {:?} failed: {:?}",

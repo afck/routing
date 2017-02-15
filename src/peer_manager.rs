@@ -1318,6 +1318,11 @@ impl PeerManager {
         self.peer_map.get_by_name(name).map(Peer::state)
     }
 
+    /// Returns whether the given ID is known to us.
+    pub fn known_id(&self, pub_id: &PublicId) -> bool {
+        self.peer_map.get_by_name(pub_id.name()).map_or(false, |peer| peer.pub_id == *pub_id)
+    }
+
     /// Returns the given peer's state, if present.
     fn get_state(&self, peer_id: &PeerId) -> Option<&PeerState> {
         self.peer_map.get(peer_id).map(Peer::state)

@@ -33,9 +33,9 @@ use routing_table::{Prefix, Xorable};
 use routing_table::Authority;
 use rust_sodium::crypto::{box_, sign};
 use rust_sodium::crypto::hash::sha256;
+use std::{cmp, iter};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::{self, Debug, Formatter};
-use std::iter;
 use std::time::Duration;
 use super::QUORUM;
 use types::MessageId;
@@ -307,22 +307,23 @@ impl SignedMessage {
 
     /// Add list of members of a relaying section
     pub fn add_relaying_section(&mut self, section: SignedSectionList) {
-        self.relay_sections.push(section);
+        if self.relay_sections.last() != Some(&section) {
+            self.relay_sections.push(section);
+        }
     }
 
-    /// Confirms the signatures.
+    /// Returns the last entry of the relay sections list.
+    pub fn last_relay_section(&self) -> Option<&SignedSectionList> {
+        self.relay_sections.last()
+    }
+
+    /// Confirms the signatures, assuming that the last relay section is valid.
     ///
     /// `min_section_size` is required when the message is from a _group_ (see doc on `Authority`).
-    ///
-    /// `known_section` is used to kick-start hop-by-hop verification. It is required to verify
-    /// the source section/group; it should be mandatory but currently clients don't know who
-    /// the members of their proxy's section are (TODO).
-    pub fn check_integrity(&self,
-                           min_section_size: usize,
-                           known_section: Option<&SectionList>)
-                           -> Result<(), RoutingError> {
+    pub fn check_integrity(&self, min_section_size: usize) -> Result<(), RoutingError> {
         fn check_enough_sigs(ssl: &SignedSectionList,
-                             last_verified: &SectionList)
+                             last_verified: &SectionList,
+                             min_section_size: usize)
                              -> Result<(), RoutingError> {
             let bytes = serialise(&ssl.list)?;
             // Now find all signatures of bytes from ssl which are valid and from a node
@@ -334,17 +335,20 @@ impl SignedMessage {
                     sign::verify_detached(sig, &bytes, pub_id.signing_public_key())
                 })
                 .count();
-            if QUORUM * last_verified.pub_ids.len() > 100 * valid_sigs {
+            // TODO: For now pretend the section has minimal size. Once splits and merges are
+            //       ordered and we can reference individual entries in a section's change record,
+            //       this `cmp::min` should be removed again.
+            if QUORUM * cmp::min(min_section_size, last_verified.pub_ids.len()) > 100 * valid_sigs {
                 return Err(RoutingError::NotEnoughSignatures);
             }
             Ok(())
         }
 
         // -----  first, verify the route  -----
-        if let Some(known_section) = known_section {
-            let mut last_verified = known_section;
-            for prev_hop in self.relay_sections.iter().rev() {
-                check_enough_sigs(prev_hop, last_verified)?;
+        if let Some(last_ssl) = self.relay_sections.last() {
+            let mut last_verified = &last_ssl.list;
+            for prev_hop in self.relay_sections.iter().rev().skip(1) {
+                check_enough_sigs(prev_hop, last_verified, min_section_size)?;
                 last_verified = &prev_hop.list;
             }
 
@@ -354,7 +358,7 @@ impl SignedMessage {
             // of its section, so we resolve that and use that to verify the rest.
             for src in &self.src_sections {
                 if src.list.prefix == last_verified.prefix {
-                    check_enough_sigs(src, last_verified)?;
+                    check_enough_sigs(src, last_verified, min_section_size)?;
                     last_verified = &src.list;
                 }
             }
@@ -363,7 +367,7 @@ impl SignedMessage {
                     // we already verified this section list
                     continue;
                 }
-                check_enough_sigs(src, last_verified)?;
+                check_enough_sigs(src, last_verified, min_section_size)?;
             }
         }
 
@@ -1322,7 +1326,7 @@ mod tests {
         assert_eq!(Some(full_id.public_id()),
                    signed_message.signatures.keys().next());
 
-        unwrap!(signed_message.check_integrity(min_section_size, None));
+        unwrap!(signed_message.check_integrity(min_section_size));
 
         let full_id = FullId::new();
         let bytes_to_sign = unwrap!(serialise(&(&routing_message, full_id.public_id())));
@@ -1331,7 +1335,7 @@ mod tests {
         signed_message.signatures = iter::once((*full_id.public_id(), signature)).collect();
 
         // Invalid because it's not signed by the sender:
-        assert!(signed_message.check_integrity(min_section_size, None).is_err());
+        assert!(signed_message.check_integrity(min_section_size).is_err());
         // However, the signature itself should be valid:
         assert!(signed_message.has_enough_sigs(min_section_size));
     }
