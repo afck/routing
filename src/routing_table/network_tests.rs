@@ -22,7 +22,7 @@
 
 use maidsafe_utilities::SeededRng;
 use rand::Rng;
-use routing_table::{Iter, OtherMergeDetails, OwnMergeDetails, OwnMergeState};
+use routing_table::{Iter, OtherMergeDetails, OwnMergeDetails};
 use routing_table::xorable::Xorable;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::{Binary, Debug};
@@ -130,8 +130,10 @@ impl Network {
                 assert_eq!(name, removal_details.name);
                 assert_eq!(removed_node_is_in_our_section,
                            removal_details.was_in_our_section);
-                if let Some(info) = node.should_merge() {
-                    Network::store_merge_info(&mut merge_own_info, *node.our_prefix(), info);
+                if node.should_merge() {
+                    Network::store_merge_info(&mut merge_own_info,
+                                              *node.our_prefix(),
+                                              node.merge_details());
                 }
             } else {
                 match node.remove(&name) {
@@ -146,41 +148,53 @@ impl Network {
         while !merge_own_info.is_empty() {
             let mut merge_other_info: HashMap<Prefix<u64>, OtherMergeInfo> = HashMap::new();
             // handle broadcast of merge_own_section
-            let own_info = merge_own_info;
+            let mut own_info = BTreeMap::new();
+            for (_, merge_own_details) in merge_own_info {
+                assert!(own_info.entry(merge_own_details.merge_prefix)
+                    .or_insert_with(BTreeMap::new)
+                    .insert(merge_own_details.sender_prefix, merge_own_details.sections)
+                    .is_none());
+            }
             merge_own_info = HashMap::new();
-            for (_, merge_own_details) in own_info {
-                let nodes = self.nodes_covered_by_prefixes(&[merge_own_details.merge_prefix]);
+            for (merge_prefix, section_maps) in own_info {
+                assert_eq!(2, section_maps.len());
+                let new_prefixes: BTreeSet<Prefix<u64>> =
+                    section_maps.values().flat_map(BTreeMap::keys).cloned().collect();
+                let new_peers: BTreeSet<u64> =
+                    section_maps.into_iter()
+                        .flat_map(|(_, sections)| {
+                            sections.into_iter().flat_map(|(_, members)| members)
+                        })
+                        .collect();
+                let new_section: BTreeSet<u64> =
+                    new_peers.iter().filter(|name| merge_prefix.matches(name)).cloned().collect();
+                let nodes = self.nodes_covered_by_prefixes(&[merge_prefix]);
                 for node in &nodes {
                     let target_node = unwrap!(self.nodes.get_mut(&node));
-                    let node_expected = expected_peers.entry(*node)
-                        .or_insert_with(HashSet::new);
-                    for section in &merge_own_details.sections {
-                        node_expected.extend(
-                            section.1.iter().filter(|name| !target_node.has(name)));
+                    let node_expected = expected_peers.entry(*node).or_insert_with(HashSet::new);
+                    node_expected.extend(new_peers.iter().filter(|name| !target_node.has(name)));
+                    let targets = target_node.merge_own_section(new_prefixes.clone(), merge_prefix);
+                    let other_merge_details = OtherMergeDetails {
+                        prefix: merge_prefix,
+                        section: new_section.clone(),
+                    };
+                    Network::store_merge_info(&mut merge_other_info,
+                                              *target_node.our_prefix(),
+                                              (targets, other_merge_details));
+                    // Forcibly add new connections.
+                    for name in node_expected.clone() {
+                        // Try adding each node we should be connected to.
+                        // Ignore failures and ignore splits.
+                        if let Err(e) = target_node.add(name) {
+                            panic!("Error adding node: {:?}", e);
+                        }
+                        node_expected.remove(&name);
                     }
-                    match target_node.merge_own_section(merge_own_details.clone()) {
-                        OwnMergeState::Ongoing |
-                        OwnMergeState::AlreadyMerged => (),
-                        OwnMergeState::Completed { targets, merge_details } => {
-                            Network::store_merge_info(&mut merge_other_info,
+                    if node_expected.is_empty() {
+                        if target_node.should_merge() {
+                            Network::store_merge_info(&mut merge_own_info,
                                                       *target_node.our_prefix(),
-                                                      (targets, merge_details));
-                            // Forcibly add new connections.
-                            for name in node_expected.clone() {
-                                // Try adding each node we should be connected to.
-                                // Ignore failures and ignore splits.
-                                if let Err(e) = target_node.add(name) {
-                                    panic!("Error adding node: {:?}", e);
-                                }
-                                node_expected.remove(&name);
-                            }
-                            if node_expected.is_empty() {
-                                if let Some(info) = target_node.should_merge() {
-                                    Network::store_merge_info(&mut merge_own_info,
-                                                              *target_node.our_prefix(),
-                                                              info);
-                                }
-                            }
+                                                      target_node.merge_details());
                         }
                     }
                 }
@@ -196,10 +210,10 @@ impl Network {
                     for contact in contacts {
                         let _ = target_node.add(contact);
                     }
-                    if let Some(info) = target_node.should_merge() {
+                    if target_node.should_merge() {
                         Network::store_merge_info(&mut merge_own_info,
                                                   *target_node.our_prefix(),
-                                                  info);
+                                                  target_node.merge_details());
                     }
                 }
             }

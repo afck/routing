@@ -70,6 +70,7 @@ pub struct Stats {
     msg_section_update: usize,
     msg_section_split: usize,
     msg_own_section_merge: usize,
+    msg_finalise_own_section_merge: usize,
     msg_other_section_merge: usize,
     msg_rt_req: usize,
     msg_rt_rsp: usize,
@@ -153,6 +154,7 @@ impl Stats {
             MessageContent::SectionUpdate { .. } => self.msg_section_update += 1,
             MessageContent::SectionSplit(..) => self.msg_section_split += 1,
             MessageContent::OwnSectionMerge(..) => self.msg_own_section_merge += 1,
+            MessageContent::FinaliseOwnSectionMerge(..) => self.msg_finalise_own_section_merge += 1,
             MessageContent::OtherSectionMerge(..) => self.msg_other_section_merge += 1,
             MessageContent::RoutingTableRequest(..) => self.msg_rt_req += 1,
             MessageContent::RoutingTableResponse { .. } => self.msg_rt_rsp += 1,
@@ -221,8 +223,8 @@ impl Stats {
             info!(target: "routing_stats",
                   "Stats - Hops (Request/Response) - GetNodeName: {}/{}, ExpectCandidate: {}, \
                    AcceptAsCandidate: {}, SectionUpdate: {}, SectionSplit: {}, \
-                   OwnSectionMerge: {}, OtherSectionMerge: {}, RoutingTable: {}/{}, \
-                   ConnectionInfo: {}/{}, CandidateApproval: {}, NodeApproval: {}, Ack: {}",
+                   SectionMerge: {}/{}/{}, RoutingTable: {}/{}, ConnectionInfo: {}/{}, \
+                   CandidateApproval: {}, NodeApproval: {}, Ack: {}",
                   self.msg_get_node_name,
                   self.msg_get_node_name_rsp,
                   self.msg_expect_candidate,
@@ -230,6 +232,7 @@ impl Stats {
                   self.msg_section_update,
                   self.msg_section_split,
                   self.msg_own_section_merge,
+                  self.msg_finalise_own_section_merge,
                   self.msg_other_section_merge,
                   self.msg_rt_req,
                   self.msg_rt_rsp,

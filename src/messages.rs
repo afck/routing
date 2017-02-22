@@ -614,12 +614,17 @@ pub enum MessageContent {
     },
     /// Sent to all connected peers when our own section splits
     SectionSplit(Prefix<XorName>, XorName),
-    /// Sent amongst members of a newly-merged section to allow synchronisation of their routing
-    /// tables before notifying other connected peers of the merge.
+    /// Sent amongst members of two sections to initiate a merge.
     ///
     /// The source and destination authorities are both `PrefixSection` types, conveying the
     /// section sending this merge message and the target prefix of the merge respectively.
     OwnSectionMerge(SectionMap),
+    /// Sent amongst members of two sections to reach consensus on a merge: It contains the union
+    /// of the two halves routing tables from the `OwnSectionMerge`.
+    ///
+    /// The source and destination authorities are the `PrefixSection` corresponding to the
+    /// post-merge section.
+    FinaliseOwnSectionMerge(SectionMap),
     /// Sent by members of a newly-merged section to peers outwith the merged section to notify them
     /// of the merge.
     ///
@@ -808,6 +813,9 @@ impl Debug for MessageContent {
                 write!(formatter, "SectionSplit({:?}, {:?})", prefix, joining_node)
             }
             OwnSectionMerge(ref sections) => write!(formatter, "OwnSectionMerge({:?})", sections),
+            FinaliseOwnSectionMerge(ref sections) => {
+                write!(formatter, "FinaliseOwnSectionMerge({:?})", sections)
+            }
             OtherSectionMerge(ref section) => write!(formatter, "OtherSectionMerge({:?})", section),
             Ack(ack, priority) => write!(formatter, "Ack({:?}, {})", ack, priority),
             UserMessagePart { hash, part_count, part_index, priority, cacheable, .. } => {

@@ -21,8 +21,7 @@ use id::PublicId;
 use itertools::Itertools;
 use rand;
 use resource_proof::ResourceProof;
-use routing_table::{Authority, OtherMergeDetails, OwnMergeDetails, OwnMergeState, Prefix,
-                    RemovalDetails, RoutingTable};
+use routing_table::{Authority, OtherMergeDetails, Prefix, RemovalDetails, RoutingTable};
 use routing_table::Error as RoutingTableError;
 use rust_sodium::crypto::hash::sha256;
 use rust_sodium::crypto::sign;
@@ -741,59 +740,47 @@ impl PeerManager {
     /// Wraps `RoutingTable::should_merge` with an extra check.
     ///
     /// Returns sender prefix, merge prefix, then sections.
-    pub fn should_merge(&self) -> Option<(Prefix<XorName>, Prefix<XorName>, SectionMap)> {
-        if !self.routing_table.they_want_to_merge() && !self.expected_peers.is_empty() {
+    pub fn should_merge(&self,
+                        force: bool)
+                        -> Option<(Prefix<XorName>, Prefix<XorName>, SectionMap)> {
+        if !force && (!self.expected_peers.is_empty() || !self.routing_table.should_merge()) {
             return None;
         }
-        self.routing_table.should_merge().map(|merge_details| {
-            let sections =
-                merge_details.sections
-                    .into_iter()
-                    .map(|(prefix, members)| {
-                        (prefix, self.get_pub_ids(&members).into_iter().collect())
-                    })
-                    .collect();
-            (merge_details.sender_prefix, merge_details.merge_prefix, sections)
-        })
+        let merge_details = self.routing_table.merge_details();
+        let sections = merge_details.sections
+            .into_iter()
+            .map(|(prefix, members)| (prefix, self.get_pub_ids(&members).into_iter().collect()))
+            .collect();
+        Some((merge_details.sender_prefix, merge_details.merge_prefix, sections))
     }
 
     // Returns the `OwnMergeState` from `RoutingTable` which defines what further action needs to be
     // taken by the node, and the list of peers to which we should now connect (only those within
     // the merging sections for now).
     pub fn merge_own_section(&mut self,
-                             sender_prefix: Prefix<XorName>,
-                             merge_prefix: Prefix<XorName>,
-                             sections: SectionMap)
-                             -> (OwnMergeState<XorName>, Vec<PublicId>) {
+                             sections: SectionMap,
+                             merge_prefix: Prefix<XorName>)
+                             -> (BTreeSet<Prefix<XorName>>, BTreeSet<PublicId>, Vec<PublicId>) {
         self.remove_expired();
-        let needed = sections.iter()
-            .flat_map(|(_, pub_ids)| pub_ids)
-            .filter(|pub_id| !self.routing_table.has(pub_id.name()))
+        let own_section = sections.iter()
+            .filter(|&(pfx, _)| merge_prefix.is_compatible(pfx))
+            .flat_map(|(_, members)| members)
             .cloned()
             .collect();
-
-        let sections_as_names = sections.into_iter()
-            .map(|(prefix, members)| {
-                (prefix, members.into_iter().map(|pub_id| *pub_id.name()).collect::<BTreeSet<_>>())
-            })
-            .collect();
-
-        let own_merge_details = OwnMergeDetails {
-            sender_prefix: sender_prefix,
-            merge_prefix: merge_prefix,
-            sections: sections_as_names,
-        };
+        let prefixes = sections.keys().cloned().collect();
+        let needed = sections.into_iter()
+            .flat_map(|(_, pub_ids)| pub_ids)
+            .filter(|pub_id| !self.routing_table.has(pub_id.name()))
+            .collect_vec();
         let mut expected_peers = mem::replace(&mut self.expected_peers, HashMap::new());
-        expected_peers.extend(own_merge_details.sections
-            .values()
-            .flat_map(|section| section.iter())
-            .filter_map(|name| if self.routing_table.has(name) {
+        expected_peers.extend(needed.iter()
+            .filter_map(|pub_id| if self.routing_table.has(pub_id.name()) {
                 None
             } else {
-                Some((*name, Instant::now()))
+                Some((*pub_id.name(), Instant::now()))
             }));
         self.expected_peers = expected_peers;
-        (self.routing_table.merge_own_section(own_merge_details), needed)
+        (self.routing_table.merge_own_section(prefixes, merge_prefix), own_section, needed)
     }
 
     pub fn merge_other_section(&mut self,

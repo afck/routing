@@ -36,7 +36,7 @@ use peer_manager::{ConnectionInfoPreparedResult, PeerManager, PeerState,
 use rand::{self, Rng};
 use resource_proof::ResourceProof;
 use routing_message_filter::{FilteringResult, RoutingMessageFilter};
-use routing_table::{Authority, OtherMergeDetails, OwnMergeState, Prefix, RemovalDetails, Xorable};
+use routing_table::{Authority, Prefix, RemovalDetails, Xorable};
 use routing_table::Error as RoutingTableError;
 #[cfg(feature = "use-mock-crust")]
 use routing_table::RoutingTable;
@@ -50,6 +50,7 @@ use std::{cmp, fmt, iter, mem};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 #[cfg(feature = "use-mock-crust")]
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::fmt::{Debug, Formatter};
 use std::time::{Duration, Instant};
 use super::common::{Base, Bootstrapped, USER_MSG_CACHE_EXPIRY_DURATION_SECS};
@@ -80,6 +81,8 @@ const APPROVAL_TIMEOUT_SECS: u64 = RESOURCE_PROOF_DURATION_SECS + ACCUMULATION_T
 const APPROVAL_PROGRESS_INTERVAL_SECS: u64 = 30;
 /// Interval between displaying info about current candidate, in seconds.
 const CANDIDATE_STATUS_INTERVAL_SECS: u64 = 60;
+/// Number of seconds after which a received `OwnSectionMerge` message is discarded.
+const OWN_SECTION_MERGE_TIMEOUT_SECS: u64 = 60;
 
 pub struct Node {
     ack_mgr: AckManager,
@@ -119,6 +122,8 @@ pub struct Node {
     candidate_timer_token: Option<u64>,
     /// The timer token for displaying the current candidate status.
     candidate_status_token: Option<u64>,
+    /// Caches `OwnSectionMerge` messages until both merging sections have sent one.
+    own_section_merge_cache: Option<(Prefix<XorName>, SectionMap, Instant)>,
     /// Map of ResourceProofResponse parts.
     resource_proof_response_parts: HashMap<PeerId, Vec<DirectMessage>>,
     /// Number of expected resource proof challengers.
@@ -219,6 +224,7 @@ impl Node {
             tunnels: Default::default(),
             user_msg_cache: UserMessageCache::with_expiry_duration(user_msg_cache_duration),
             next_node_name: None,
+            own_section_merge_cache: None,
             rt_msg_id: None,
             rt_timeout: Duration::from_secs(RT_MIN_TIMEOUT_SECS),
             rt_timer_token: None,
@@ -789,6 +795,7 @@ impl Node {
             match routing_msg.content {
                 SectionSplit(..) |
                 OwnSectionMerge(..) |
+                FinaliseOwnSectionMerge(..) |
                 OtherSectionMerge(..) |
                 ExpectCandidate { .. } |
                 AcceptAsCandidate { .. } |
@@ -881,7 +888,13 @@ impl Node {
             (OwnSectionMerge(sections),
              PrefixSection(sender_prefix),
              PrefixSection(merge_prefix)) => {
-                self.handle_own_section_merge(sender_prefix, merge_prefix, sections, outbox)
+                self.handle_own_section_merge(sender_prefix, merge_prefix, sections);
+                Ok(())
+            }
+            (FinaliseOwnSectionMerge(sections),
+             PrefixSection(merge_prefix),
+             PrefixSection(dst_prefix)) => {
+                self.handle_finalise_own_section_merge(merge_prefix, dst_prefix, sections, outbox)
             }
             (OtherSectionMerge(section), PrefixSection(merge_prefix), PrefixSection(_)) => {
                 self.handle_other_section_merge(merge_prefix, section, outbox)
@@ -938,7 +951,7 @@ impl Node {
               self.peer_mgr.routing_table().our_prefix(),
               candidate_id.name(),
               opt_peer_id);
-        if self.peer_mgr.routing_table().is_merge_in_process() {
+        if self.own_section_merge_cache.is_some() {
             debug!("{:?} Not sending NodeApproval since our section is currently merging.",
                    self);
         } else {
@@ -2105,49 +2118,104 @@ impl Node {
     }
 
     fn handle_own_section_merge(&mut self,
-                                sender_prefix: Prefix<XorName>,
-                                merge_prefix: Prefix<XorName>,
-                                sections: SectionMap,
-                                outbox: &mut EventBox)
-                                -> Result<(), RoutingError> {
-        let (merge_state, needed_peers) = self.peer_mgr
-            .merge_own_section(sender_prefix, merge_prefix, sections);
-
-        match merge_state {
-            OwnMergeState::Ongoing => self.merge_if_necessary(),
-            OwnMergeState::AlreadyMerged => (),
-            OwnMergeState::Completed { targets, merge_details } => {
-                // TODO - the event should maybe only fire once all new connections have been made?
-                outbox.send_event(Event::SectionMerge(merge_details.prefix));
-                info!("{:?} Own section merge completed. Prefixes: {:?}",
-                      self,
-                      self.peer_mgr.routing_table().prefixes());
-                self.merge_if_necessary();
-
-                // after the merge, half of our section won't have our signatures -- send them
-                for prefix in self.peer_mgr.routing_table().prefixes() {
-                    self.send_section_list_signature(prefix, None);
-                }
-                self.send_other_section_merge(targets, merge_details);
-
-                let own_name = *self.name();
-                for needed in &needed_peers {
-                    debug!("{:?} Sending connection info to {:?} due to merging own section.",
+                                sender_pfx: Prefix<XorName>,
+                                merge_pfx: Prefix<XorName>,
+                                sections: SectionMap) {
+        let our_prefix = *self.peer_mgr.routing_table().our_prefix();
+        if sender_pfx.popped() != merge_pfx || our_prefix.popped() != merge_pfx {
+            trace!("{:?} Received OwnSectionMerge for wrong merge {:?} -> {:?}: {:?}.",
+                   self,
+                   sender_pfx,
+                   merge_pfx,
+                   sections);
+        }
+        let mut new_sections = match self.own_section_merge_cache.take() {
+            None => {
+                self.own_section_merge_cache = Some((sender_pfx, sections, Instant::now()));
+                return;
+            }
+            Some((pfx, other_sections, timestamp)) => {
+                if timestamp.elapsed() >= Duration::from_secs(OWN_SECTION_MERGE_TIMEOUT_SECS) ||
+                   pfx == sender_pfx || pfx.popped() != merge_pfx ||
+                   other_sections.iter().any(|(pfx0, _)| {
+                    sections.iter().any(|(pfx1, _)| pfx0 != pfx1 && pfx0.is_compatible(pfx1))
+                }) {
+                    trace!("{:?} Removing expired or incompatible OwnSectionMerge from {:?}: \
+                            {:?}.",
                            self,
-                           needed);
-                    if let Err(error) = self.send_connection_info_request(*needed,
-                                                      Authority::ManagedNode(own_name),
-                                                      Authority::ManagedNode(*needed.name()),
-                                                      outbox) {
-                        debug!("{:?} - Failed to send connection info to {:?}: {:?}",
-                               self,
-                               needed,
-                               error);
-                    }
+                           pfx,
+                           other_sections);
+                    self.own_section_merge_cache = Some((sender_pfx, sections, Instant::now()));
+                    return;
+                }
+                other_sections
+            }
+        };
+
+        for (pfx, members) in sections {
+            match new_sections.entry(pfx) {
+                Entry::Occupied(mut entry) => {
+                    entry.get_mut().extend(members);
+                }
+                Entry::Vacant(entry) => {
+                    let _members_ref = entry.insert(members);
                 }
             }
         }
+        let content = MessageContent::FinaliseOwnSectionMerge(new_sections);
+        let auth = Authority::PrefixSection(merge_pfx);
+        if let Err(err) = self.send_routing_message(auth, auth, content) {
+            debug!("{:?} Failed to send RoutingTableRequest: {:?}.", self, err);
+        }
+    }
 
+    fn handle_finalise_own_section_merge(&mut self,
+                                         merge_prefix: Prefix<XorName>,
+                                         dst_prefix: Prefix<XorName>,
+                                         sections: SectionMap,
+                                         outbox: &mut EventBox)
+                                         -> Result<(), RoutingError> {
+        if merge_prefix != dst_prefix ||
+           merge_prefix != self.peer_mgr.routing_table().our_prefix().popped() {
+            debug!("{:?} Source and destination in FinaliseOwnSectionMerge disagree or are \
+                    unsuitable: {:?}, {:?}",
+                   self,
+                   merge_prefix,
+                   dst_prefix);
+            return Err(RoutingError::BadAuthority);
+        }
+        let (targets, own_section, needed_peers) = self.peer_mgr
+            .merge_own_section(sections, merge_prefix);
+
+        // TODO - the event should maybe only fire once all new connections have been made?
+        outbox.send_event(Event::SectionMerge(merge_prefix));
+        info!("{:?} Own section merge completed. Prefixes: {:?}",
+              self,
+              self.peer_mgr.routing_table().prefixes());
+
+        // after the merge, half of our section won't have our signatures -- send them
+        for prefix in self.peer_mgr.routing_table().prefixes() {
+            self.send_section_list_signature(prefix, None);
+        }
+        self.send_other_section_merge(targets, own_section);
+
+        let own_name = *self.name();
+        for needed in &needed_peers {
+            debug!("{:?} Sending connection info to {:?} due to merging own section.",
+                   self,
+                   needed);
+            if let Err(error) = self.send_connection_info_request(*needed,
+                                              Authority::ManagedNode(own_name),
+                                              Authority::ManagedNode(*needed.name()),
+                                              outbox) {
+                debug!("{:?} - Failed to send connection info to {:?}: {:?}",
+                       self,
+                       needed,
+                       error);
+            }
+        }
+
+        self.merge_if_necessary();
         self.reset_rt_timer();
         Ok(())
     }
@@ -2313,7 +2381,7 @@ impl Node {
             Ok(info) => info,
         };
 
-        if self.peer_mgr.routing_table().is_merge_in_process() {
+        if self.own_section_merge_cache.is_some() {
             debug!("{:?} Resource proof duration has finished, but not voting to approve \
                    candidate {} since our section is currently merging.",
                    self,
@@ -2723,7 +2791,8 @@ impl Node {
     }
 
     fn merge_if_necessary(&mut self) {
-        if let Some((sender_prefix, merge_prefix, sections)) = self.peer_mgr.should_merge() {
+        if let Some((sender_prefix, merge_prefix, sections)) =
+            self.peer_mgr.should_merge(self.they_want_to_merge()) {
             let content = MessageContent::OwnSectionMerge(sections);
             let src = Authority::PrefixSection(sender_prefix);
             let dst = Authority::PrefixSection(merge_prefix);
@@ -2733,13 +2802,18 @@ impl Node {
         }
     }
 
+    fn they_want_to_merge(&self) -> bool {
+        self.own_section_merge_cache.as_ref().map_or(false, |&(ref prefix, _, _)| {
+            prefix != self.peer_mgr.routing_table().our_prefix()
+        })
+    }
+
     fn send_other_section_merge(&mut self,
                                 targets: BTreeSet<Prefix<XorName>>,
-                                merge_details: OtherMergeDetails<XorName>) {
-        let section = self.peer_mgr.get_pub_ids(&merge_details.section);
+                                own_section: BTreeSet<PublicId>) {
         for target in &targets {
-            let content = MessageContent::OtherSectionMerge(section.clone());
-            let src = Authority::PrefixSection(merge_details.prefix);
+            let content = MessageContent::OtherSectionMerge(own_section.clone());
+            let src = Authority::PrefixSection(*self.peer_mgr.routing_table().our_prefix());
             let dst = Authority::PrefixSection(*target);
             if let Err(err) = self.send_routing_message(src, dst, content) {
                 debug!("{:?} Failed to send OtherSectionMerge: {:?}.", self, err);

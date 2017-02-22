@@ -198,26 +198,6 @@ pub struct RemovalDetails<T: Binary + Clone + Copy + Default + Hash + Xorable> {
 
 
 
-// Details returned by `RoutingTable::merge_own_section()`.
-pub enum OwnMergeState<T: Binary + Clone + Copy + Default + Hash + Xorable> {
-    // If an ongoing merge is happening, and this call to `merge_own_section()` doesn't complete the
-    // merge (i.e. at least one of the merging sections hasn't yet sent us its merge details), then
-    // `Ongoing` is returned, implying that no further action by the caller is required.
-    Ongoing,
-    // If an ongoing merge is happening, and this call to `merge_own_section()` completes the merge
-    // (i.e. all merging sections have sent us their merge details), then `Completed` is returned,
-    // containing the appropriate targets (the `Prefix`es of all sections outwith the merging ones)
-    // and the merge details they each need to receive (the new prefix and merged section).
-    Completed {
-        targets: BTreeSet<Prefix<T>>,
-        merge_details: OtherMergeDetails<T>,
-    },
-    // The merge has already completed, implying that no further action by the caller is required.
-    AlreadyMerged,
-}
-
-
-
 /// A routing table to manage contacts for a node.
 ///
 /// It maintains a list of sections (identified by a `Prefix<T>`), each with a
@@ -237,10 +217,6 @@ pub struct RoutingTable<T: Binary + Clone + Copy + Debug + Default + Hash + Xora
     our_section: BTreeSet<T>,
     // Other sections (excludes our own) (TODO: rename)
     sections: Sections<T>,
-    // Whether we have sent our merge details to the other section.
-    we_want_to_merge: bool,
-    // Whether the other section has sent their merge details to us.
-    they_want_to_merge: bool,
 }
 
 impl<T: Binary + Clone + Copy + Debug + Default + Hash + Xorable> RoutingTable<T> {
@@ -254,8 +230,6 @@ impl<T: Binary + Clone + Copy + Debug + Default + Hash + Xorable> RoutingTable<T
             our_section: our_section,
             our_prefix: Default::default(),
             sections: BTreeMap::new(),
-            we_want_to_merge: false,
-            they_want_to_merge: false,
         }
     }
 
@@ -515,9 +489,8 @@ impl<T: Binary + Clone + Copy + Debug + Default + Hash + Xorable> RoutingTable<T
         let close_to_merging_with_us = |(prefix, section): (&Prefix<T>, &BTreeSet<T>)| {
             prefix.popped().is_compatible(&self.our_prefix) && section.len() < split_size
         };
-        // If we're currently merging or are close to merging, we shouldn't split.
-        if self.we_want_to_merge || self.they_want_to_merge ||
-           self.sections.iter().any(close_to_merging_with_us) {
+        // If we're currently close to merging, we shouldn't split.
+        if self.sections.iter().any(close_to_merging_with_us) {
             return Ok(false);
         }
 
@@ -623,12 +596,7 @@ impl<T: Binary + Clone + Copy + Debug + Default + Hash + Xorable> RoutingTable<T
         Ok(removal_details)
     }
 
-    /// Returns whether the other section has already initiated a merge.
-    pub fn they_want_to_merge(&self) -> bool {
-        self.they_want_to_merge
-    }
-
-    /// If our section is required to merge, returns the details to initiate merging.
+    /// Returns whether our section is required to merge.
     ///
     /// Merging is required if any section has dropped below the minimum size and can only restore
     /// it by ultimately merging with us.
@@ -638,68 +606,65 @@ impl<T: Binary + Clone + Copy + Debug + Default + Hash + Xorable> RoutingTable<T
     /// then this will return `true` only in the latter two. Once they are merged and have
     /// established all their new connections, it will return `true` in `01` and `00`. Only after
     /// that, the section `0` will merge with section `1`.
-    pub fn should_merge(&self) -> Option<OwnMergeDetails<T>> {
+    pub fn should_merge(&self) -> bool {
         let bit_count = self.our_prefix.bit_count();
-        let doesnt_need_to_merge_with_us = |(prefix, section): (&Prefix<T>, &BTreeSet<T>)| {
-            !prefix.popped().is_compatible(&self.our_prefix) ||
-            section.len() >= self.min_section_size
-        };
-        if bit_count == 0 || self.we_want_to_merge ||
+        if bit_count == 0 ||
            !self.sections.contains_key(&self.our_prefix.with_flipped_bit(bit_count - 1)) {
-            return None; // We can't merge, or we already sent our merge message.
+            return false; // We can't merge.
         }
-        if !self.they_want_to_merge && self.our_section.len() >= self.min_section_size &&
-           self.sections.iter().all(doesnt_need_to_merge_with_us) {
-            return None; // There is no reason to merge.
-        }
-        let merge_prefix = self.our_prefix.popped();
-        Some(OwnMergeDetails {
-            sender_prefix: self.our_prefix,
-            merge_prefix: merge_prefix,
-            sections: self.all_sections(),
-        })
+        let needs_to_merge_with_us = |(prefix, section): (&Prefix<T>, &BTreeSet<T>)| {
+            prefix.popped().is_compatible(&self.our_prefix) && section.len() < self.min_section_size
+        };
+        self.our_section.len() < self.min_section_size ||
+        self.sections.iter().any(needs_to_merge_with_us)
     }
 
-    /// When a merge of our own section is triggered (either from our own section or a neighbouring
-    /// one) this function handles the incoming merge details from the peers within the merging
-    /// sections.
-    ///
-    /// The actual merge of the section is only done once all expected merging sections have
-    /// provided details.  See the docs for `OwnMergeState` for full details of the return value.
-    pub fn merge_own_section(&mut self, merge_details: OwnMergeDetails<T>) -> OwnMergeState<T> {
-        // TODO: Return an error if they are not compatible instead?
-        if !self.our_prefix.is_compatible(&merge_details.merge_prefix) ||
-           self.our_prefix.bit_count() != merge_details.merge_prefix.bit_count() + 1 {
-            debug!("{:?}: Attempt to call merge_own_section() for an already merged prefix {:?}",
-                   self.our_name,
-                   merge_details.merge_prefix);
-            return OwnMergeState::AlreadyMerged;
+    /// Returns the details to initiate merging.
+    pub fn merge_details(&self) -> OwnMergeDetails<T> {
+        OwnMergeDetails {
+            sender_prefix: self.our_prefix,
+            merge_prefix: self.our_prefix.popped(),
+            sections: self.all_sections(),
         }
-        for prefix in merge_details.sections.keys() {
-            if *prefix == self.our_prefix || self.sections.contains_key(prefix) {
+    }
+
+    /// When a merge of our own section is triggered this function handles the incoming merge
+    /// details from the peers within the merging sections.
+    pub fn merge_own_section(&mut self,
+                             prefixes: BTreeSet<Prefix<T>>,
+                             merge_prefix: Prefix<T>)
+                             -> BTreeSet<Prefix<T>> {
+        // TODO: Return an error if they are not compatible instead?
+        if !self.our_prefix.is_compatible(&merge_prefix) ||
+           self.our_prefix.bit_count() != merge_prefix.bit_count() + 1 {
+            error!("{:?}: Attempt to call merge_own_section() for an already merged prefix {:?}",
+                   self.our_name,
+                   merge_prefix);
+            return BTreeSet::new();
+        }
+        for prefix in prefixes {
+            if self.sections.contains_key(&prefix) {
                 continue; // Already in our routing table.
-            } else if self.our_prefix.is_compatible(prefix) ||
+            } else if prefix == self.our_prefix || self.our_prefix.is_compatible(&prefix) ||
                       self.sections.keys().any(|pfx| prefix.is_compatible(pfx)) {
                 error!("{:?} Received unsuitable prefix {:?} in OwnSectionMerge.",
                        self.our_name,
                        prefix);
             } else {
-                self.insert_new_section(*prefix, BTreeSet::new());
+                self.insert_new_section(prefix, BTreeSet::new());
             }
         }
 
-        if merge_details.sender_prefix == self.our_prefix {
-            self.we_want_to_merge = true;
-        } else {
-            self.they_want_to_merge = true;
-        }
-        if self.we_want_to_merge && self.they_want_to_merge {
-            // We've heard from all merging sections - do the merge and return `Completed`.
-            self.finish_merging_own_section(merge_details.merge_prefix)
-        } else {
-            // We don't have the merge details from both sides yet.
-            OwnMergeState::Ongoing
-        }
+        self.merge(&merge_prefix);
+        self.add_missing_prefixes();
+        // The update needs to be sent to all neighbouring sections. However, while those are
+        // merging/splitting, our own section might not agree on their prefixes and the message can
+        // fail to accumulate. So also include results of flipping one bit in the `merge_prefix`.
+        self.sections
+            .keys()
+            .cloned()
+            .chain((0..merge_prefix.bit_count()).map(|i| merge_prefix.with_flipped_bit(i)))
+            .collect()
     }
 
     /// Merges all existing compatible sections into the new one defined by `merge_details.prefix`.
@@ -876,12 +841,6 @@ impl<T: Binary + Clone + Copy + Debug + Default + Hash + Xorable> RoutingTable<T
         target_prefix.substituted_in(*name)
     }
 
-    /// Returns true if we're currently handling a merge of our own section (i.e. we've received an
-    /// `OwnSectionMerge` from either our own section or our immediate neighbour).
-    pub fn is_merge_in_process(&self) -> bool {
-        self.we_want_to_merge || self.they_want_to_merge
-    }
-
     fn split_our_section(&mut self) -> Vec<T> {
         let next_bit = self.our_name.bit(self.our_prefix.bit_count());
         let other_prefix = self.our_prefix.pushed(!next_bit);
@@ -916,29 +875,6 @@ impl<T: Binary + Clone + Copy + Debug + Default + Hash + Xorable> RoutingTable<T
                        entry.get());
                 entry.into_mut().extend(section);
             }
-        }
-    }
-
-    fn finish_merging_own_section(&mut self, merge_prefix: Prefix<T>) -> OwnMergeState<T> {
-        self.we_want_to_merge = false;
-        self.they_want_to_merge = false;
-        self.merge(&merge_prefix);
-        self.add_missing_prefixes();
-        // The update needs to be sent to all neighbouring sections. However, while those are
-        // merging/splitting, our own section might not agree on their prefixes and the message can
-        // fail to accumulate. So also include results of flipping one bit in the `merge_prefix`.
-        let targets = self.sections
-            .keys()
-            .cloned()
-            .chain((0..merge_prefix.bit_count()).map(|i| merge_prefix.with_flipped_bit(i)))
-            .collect();
-        let other_details = OtherMergeDetails {
-            prefix: merge_prefix,
-            section: self.our_section().clone(),
-        };
-        OwnMergeState::Completed {
-            targets: targets,
-            merge_details: other_details,
         }
     }
 
@@ -1147,10 +1083,6 @@ impl<T: Binary + Clone + Copy + Debug + Default + Hash + Xorable> Binary for Rou
             };
             writeln!(formatter, "\t}}{}", comma)?;
         }
-        writeln!(formatter,
-                 "\tmerging: we {:?}, they {:?}",
-                 self.we_want_to_merge,
-                 self.they_want_to_merge)?;
         write!(formatter, "}}")
     }
 }
