@@ -1996,16 +1996,20 @@ impl Node {
     fn handle_tunnel_success(&mut self, peer_id: PeerId, dst_id: PeerId) {
         let should_disconnect = if let Some(tunnel_id) = self.tunnels.tunnel_for(&dst_id) {
             if *tunnel_id == peer_id {
-                // If tunnel_id matches the dst_id make this a no-op
+                // If tunnel_id matches the dst_id make this a no-op.
+                debug!("{:?} Received duplicate TunnelSuccess from {:?} for {:?}.",
+                       self,
+                       peer_id,
+                       dst_id);
                 return;
             } else {
                 // If we have a different tunnel node for this dst_id,
-                // should disconnect from this tunnel node
+                // we should disconnect from this tunnel node.
                 true
             }
         } else {
-            // we do not have a tunnel node for this dst_id yet.
-            // check and accept this tunnel node if required.
+            // We do not have a tunnel node for this dst_id yet.
+            // Check and accept this tunnel node if required.
             false
         };
 
@@ -2784,8 +2788,9 @@ impl Node {
     // that we're not connected to the peer or tunnel node respectively.
     fn purge_invalid_rt_entries(&mut self, outbox: &mut EventBox) -> Transition {
         let peer_details = self.peer_mgr.get_routing_peer_details();
-        for peer_id in &peer_details.out_of_sync_peers {
-            self.dropped_peer(peer_id, outbox, true);
+        for peer_id in peer_details.out_of_sync_peers {
+            self.crust_service.disconnect(peer_id);
+            self.dropped_peer(&peer_id, outbox, true);
         }
         for removal_detail in peer_details.removal_details {
             let name = removal_detail.name;
